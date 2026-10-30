@@ -118,6 +118,18 @@ pub fn playlist(url: &str) -> Result<Vec<u8>, Failure> {
     )
 }
 
+/// V-ARCHIVE 기록, 모든 패턴을 친 사람은 1 MiB 가까이라 4 MiB까지, 본문은 15초까지
+pub fn varchive(url: &str) -> Result<Vec<u8>, Failure> {
+    download_inner(
+        url,
+        4 * 1_048_576,
+        40,
+        Some(Duration::from_secs(15)),
+        PLAYLIST_RECEIVE_TIMEOUT_MS,
+        &AtomicBool::new(false),
+    )
+}
+
 fn download_inner(
     url: &str,
     cap: usize,

@@ -20,6 +20,7 @@ mod pace;
 mod playlist;
 mod popup;
 mod scene;
+mod scorecard;
 mod sys;
 mod toast;
 mod tray;
@@ -237,6 +238,7 @@ fn load_settings(p: &mut Popup) {
     let Ok(raw) = std::fs::read(settings_path()) else { return };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else { return };
     apply_settings(p, &v);
+    p.scorecard.apply_json(&v["scorecard"]);
 }
 
 /// 설정 파일 내용을 검색창에 넣음, 없거나 못 읽는 값은 그대로 (1.0.0 파일엔 keep_query·show_dlc가 없음)
@@ -277,9 +279,16 @@ fn settings_json(p: &Popup) -> serde_json::Value {
     serde_json::json!({ "mode": p.mode_choice.label(), "diff": p.diff_choice.label(), "hotkey": p.hotkey.label(), "keep_query": p.keep_query, "show_dlc": p.show_dlc, "glass": p.glass, "hidden_dlc": hidden_dlc, "hidden_songs": hidden_songs })
 }
 
+/// 설정 파일 내용에 성과표 설정을 더함, 위 설정 목록과 따로 둬서 항목이 늘어도 안 겹침
+fn settings_with_scorecard(p: &Popup) -> serde_json::Value {
+    let mut v = settings_json(p);
+    v["scorecard"] = p.scorecard.to_json();
+    v
+}
+
 /// 저장하지 못하면 알림 (다시 켜면 예전 값으로 돌아감)
 fn save_settings(a: &mut App) -> bool {
-    let ok = sys::save_file(&settings_path(), settings_json(&a.popup).to_string().as_bytes()).is_ok();
+    let ok = sys::save_file(&settings_path(), settings_with_scorecard(&a.popup).to_string().as_bytes()).is_ok();
     if !ok {
         a.toast.show("설정을 저장하지 못했어요", Badge::None, Some(3.0));
     }
@@ -731,6 +740,11 @@ fn on_message(a: &mut App, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> (Opt
         while let Some(reply) = a.playlists.take() {
             a.popup.playlist_reply(reply);
         }
+        let after = on_action(a, Action::None);
+        return (Some(LRESULT(0)), after);
+    }
+    if msg == scorecard::READY {
+        a.popup.scorecard_reply();
         let after = on_action(a, Action::None);
         return (Some(LRESULT(0)), after);
     }

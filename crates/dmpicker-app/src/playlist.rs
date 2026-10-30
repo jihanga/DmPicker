@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 /// 응답이 도착함, 검색창 창으로 옴 (main.rs의 WM_APP 메시지와 안 겹치게)
 pub const READY: u32 = WM_APP + 3;
 pub const NOT_FOUND: &str = "볼 수 없는 플레이리스트예요";
+pub const LOCAL_GONE: &str = "성과표에서 다시 만들어 주세요";
 const LATER: &str = "잠시 뒤 다시 시도해 주세요";
 const FAILED: &str = "플레이리스트를 불러오지 못했어요";
 const FAVORITES_UNREADABLE: &str = "즐겨찾기 파일을 읽지 못해서 저장할 수 없어요";
@@ -19,14 +20,25 @@ pub const FAVORITES_SAVE_FAILED: &str = "즐겨찾기를 저장하지 못했어�
 /// 히스토리에 남기는 곡·플레이리스트 수
 const RECENT_MAX: usize = 6;
 
+/// 성과표로 만든 로컬 플레이리스트 id 앞머리 (`scorecard`), djmax.gg로 요청하지 않음
+pub const LOCAL_PREFIX: &str = "va-";
+
 /// 영문·숫자·`_`·`-` 1~24자, 요청 경로와 사본 파일 이름에 그대로 씀
 fn valid_id(id: &str) -> bool {
     (1..=24).contains(&id.len()) && id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
 }
 
-/// 검색어 전체가 djmax.gg 플레이리스트 주소일 때만 그 id, 쿼리·프래그먼트는 요청에 안 보냄
+/// `va-` 뒤 16진 8자리만, "va-"로 시작하는 곡 검색어가 플레이리스트로 읽히지 않게
+pub fn is_local(id: &str) -> bool {
+    id.strip_prefix(LOCAL_PREFIX).is_some_and(|h| h.len() == 8 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// 검색어 전체가 djmax.gg 플레이리스트 주소나 로컬 플레이리스트 id일 때만 그 id, 쿼리·프래그먼트는 요청에 안 보냄
 pub fn id(query: &str) -> Option<&str> {
     let mut s = query.trim();
+    if is_local(s) {
+        return Some(s);
+    }
     for scheme in ["https://", "http://"] {
         if s.get(..scheme.len()).is_some_and(|p| p.eq_ignore_ascii_case(scheme)) {
             s = &s[scheme.len()..];
@@ -42,8 +54,11 @@ pub fn id(query: &str) -> Option<&str> {
     valid_id(id).then_some(id)
 }
 
-/// 히스토리에서 열 때 입력 칸에 넣는 주소
+/// 히스토리에서 열 때 입력 칸에 넣는 주소, 로컬 플레이리스트는 id 그대로
 pub fn url(id: &str) -> String {
+    if is_local(id) {
+        return id.to_owned();
+    }
     format!("https://djmax.gg/playlist/{id}")
 }
 

@@ -28,8 +28,11 @@ use crate::gfx::{
 use crate::hotkey::Hotkey;
 use crate::icons::Icon;
 use crate::playlist::{self, Entry, Failure, Library, Pattern, Playlist, Recent, Reply};
+use crate::scorecard::{self, Scorecard, Slot};
 use crate::sys;
 use crate::update::{DataNotice, OUTDATED_TEXT};
+
+mod scorecard_sheet;
 
 const LIMIT: usize = 50;
 const IDENTITY: windows_numerics::Matrix3x2 = windows_numerics::Matrix3x2::identity();
@@ -37,6 +40,7 @@ const TIMER_CARET: usize = 2;
 const CARET_BLINK_MS: u32 = 530;
 const TIMER_FOCUS: usize = 3; // 포커스를 잃은 뒤, 캡처 도구가 가져간 게 아니면 닫음
 const TIMER_SEARCH: usize = 4; // 입력이 멈추면 입력한 글로 검색
+const TIMER_REPEAT: usize = 5; // 성과표 값 칸을 누르고 있으면 값을 계속 바꿈 (main.rs의 TIMER_FOREGROUND (1)과 같은 창)
 /// 입력이 이만큼 멈춰야 결과를 바꿈
 /// 단어를 치면서 거치는 덜 조합된 글자마다 목록이 통째로 바뀌지 않게
 const SEARCH_DELAY_MS: u32 = 180;
@@ -84,10 +88,11 @@ const STAR_POP_EASE: Ease = Ease(0.34, 1.96, 0.64, 1.0);
 /// 튀는 점이 나타나고 멀어지는 곡선 (`Spark::at`)
 const SPARK_EASE: Ease = Ease(0.0, 0.0, 0.58, 1.0);
 
-/// 바 오른쪽 버튼 순서 (`bead_circle`)
-const BEAD_HISTORY: usize = 0;
-const BEAD_GEAR: usize = 1;
-/// 두 버튼 시차: 나올 땐 히스토리 다음 톱니, 들어갈 땐 톱니 다음 히스토리
+/// 바 오른쪽 버튼 순서 (`bead_circle`), 왼쪽부터
+const BEAD_SCORE: usize = 0;
+const BEAD_HISTORY: usize = 1;
+const BEAD_GEAR: usize = 2;
+/// 버튼 사이 시차: 나올 땐 왼쪽 버튼부터, 들어갈 땐 톱니부터
 const BEAD_STAGGER: Duration = Duration::from_millis(70);
 /// 버튼 나오기 스프링, 누른 버튼도 이걸로 돌아옴
 const BEAD_SPRING: (f32, f32) = (300.0, 17.0);
@@ -122,6 +127,12 @@ const SEG_MODE: usize = 0;
 const SEG_DIFF: usize = 1;
 const SEG_HISTORY: usize = 2;
 const SEG_EXCLUDE: usize = 3;
+/// 성과표 시트의 버튼 모드, 플레이 여부, 맥스콤보 여부
+const SEG_SC_MODE: usize = 4;
+const SEG_PLAYED: usize = 5;
+const SEG_MC: usize = 6;
+/// 성과표 범위 줄의 전체·범위
+const SEG_SCOPE: usize = 7;
 
 /// 논리 (96 dpi) 레이아웃, 검색창 전체 너비는 늘 `W`
 mod lay {
@@ -131,7 +142,7 @@ mod lay {
     pub const BAR_R: f32 = 23.0;
     pub const BTN_D: f32 = 46.0;
     pub const BTN_GAP: f32 = 8.0;
-    pub const BEADS: usize = 2; // 히스토리, 톱니 버튼 (하나당 바가 54 줄어듦)
+    pub const BEADS: usize = 3; // 성과표, 히스토리, 톱니 버튼 (하나당 바가 54 줄어듦)
     pub const GAP: f32 = 8.0; // 바와 패널 사이
     pub const PANEL_R: f32 = 20.0;
     pub const PAD: f32 = 8.0;
@@ -231,12 +242,15 @@ enum View {
     Keywords,
     /// 무작위 줄로 나온 곡, 결과·히스토리의 무작위 줄을 우클릭하거나 F2로 엶
     Rolls,
+    /// V-ARCHIVE 성과표로 임시 플레이리스트 만들기, 성과표 버튼으로 엶
+    Scorecard,
 }
 
 impl View {
-    /// 입력 칸으로 시트 목록을 찾는 보기, 원래 입력·검색어는 `list_edit`에 보관
+    /// 입력 칸을 시트가 쓰는 보기, 원래 입력·검색어는 `list_edit`에 보관
+    /// 히스토리·검색 제외는 시트 목록을 찾고 성과표는 닉네임을 씀
     fn searches_sheet(self) -> bool {
-        matches!(self, Self::History | Self::Exclude)
+        matches!(self, Self::History | Self::Exclude | Self::Scorecard)
     }
 }
 
@@ -284,6 +298,8 @@ enum Sheet {
     Keywords,
     /// 무작위 줄과 나온 곡 줄
     Rolls,
+    /// 기록 불러오기와 조건
+    Scorecard,
 }
 
 /// 결과 자리에 뜨는 안내 카드, 모두 같은 높이 (`CARD_H`)
@@ -673,6 +689,11 @@ enum Hit {
     Text,
     Gear,
     History,
+    Scorecard,
+    /// 성과표 시트의 칸 (세그먼트는 누른 칸 번호, 값 칸은 왼쪽 절반 0·오른쪽 절반 1)
+    ScoreSlot(scorecard::Slot, usize),
+    /// 성과표 시트 조건 줄 앞의 체크
+    ScoreCheck(scorecard::Slot),
     ModeSeg(usize),
     DiffSeg(usize),
     Rescan,
@@ -1007,17 +1028,24 @@ pub struct Popup {
     exclude_scroll_s: Spring, // 끝 오프셋은 한 줄보다 작을 수 있어 px로 저장함
     keyword_edit: Option<KeywordEdit>,
     roll_edit: Option<RollEdit>,
+    /// 성과표 시트 상태 (닉네임·범위·조건은 앱이 불러오고 저장함)
+    pub scorecard: Scorecard,
+    /// 성과표 조건에 맞는 (패턴 수, 그중 내 목록에 없는 패턴 수), 기록이 없으면 None
+    /// 조건·기록·닉네임이 바뀔 때만 다시 셈 (`refresh_scorecard`)
+    scorecard_count: Option<(usize, usize)>,
+    /// 누르고 있는 성과표 값 칸과 누른 쪽 절반, 그 위에 있는 동안 `TIMER_REPEAT`마다 값을 바꿈
+    score_hold: Option<(Slot, usize)>,
     hover: Hit,
     // 애니메이션
     open_s: Spring,      // 띄울 때 0에서 1로 (살짝 튐)
-    reveal: [Spring; 2], // 버튼별 0 숨김 .. 1 표시 (하나당 바가 54 줄어듦), 튐
-    beads_out: bool,     // 두 버튼을 내보내는 중 (스프링은 시차를 두고 따라감)
-    reveal_follow: Option<(Instant, usize, f32)>, // 시차 뒤에 움직일 버튼과 목표
-    bead_press: [Spring; 2], // 버튼별 배율, 마우스로 누르는 동안 부풂
+    reveal: [Spring; lay::BEADS], // 버튼별 0 숨김 .. 1 표시 (하나당 바가 54 줄어듦), 튐
+    beads_out: bool,     // 버튼들을 내보내는 중 (스프링은 시차를 두고 따라감)
+    reveal_follow: [Option<(Instant, f32)>; lay::BEADS], // 버튼별 시차 뒤에 움직일 때와 목표
+    bead_press: [Spring; lay::BEADS], // 버튼별 배율, 마우스로 누르는 동안 부풂
     bead_down: Option<(usize, View)>, // 마우스로 누르고 있는 버튼과 그때 보기, 보기가 바뀌면 놓음
-    bead_letgo: [bool; 2], // 짧게 눌렀다 뗀 버튼, 누름이 75 %까지 보인 뒤 돌아감
+    bead_letgo: [bool; lay::BEADS], // 짧게 눌렀다 뗀 버튼, 누름이 75 %까지 보인 뒤 돌아감
     bead_at: Option<(f32, f32)>, // 버튼을 누른 채인 커서 자리 (클라이언트 px), 버튼이 움직여도 원 안인지 다시 봄
-    bead_stretch: [Spring; 2], // 버튼별 가로로 늘어난 정도, 가로 속도를 따라감
+    bead_stretch: [Spring; lay::BEADS], // 버튼별 가로로 늘어난 정도, 가로 속도를 따라감
     icon_alpha: Tween,      // 두 버튼 아이콘
     panel_h: Spring,        // 보이는 패널의 높이, 내용이 바뀔 때만 움직임
     unfolding: bool,        // 사라졌거나 사라지던 판이 다시 펼쳐지는 중, 다 펼 때까지 아래 빈 곳도 판 자리
@@ -1025,7 +1053,7 @@ pub struct Popup {
     close: Tween,           // 닫는 동안 0에서 1로
     sel_y: Spring,          // 선택 강조 위쪽, 패널 px (높이는 한 줄)
     scroll_s: Spring,       // 목록 오프셋 px, scroll x 줄 간격을 따라감
-    seg: [SegThumb; 4],     // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭]
+    seg: [SegThumb; 8],     // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭, 성과표 모드·플레이·맥스콤보·범위]
     sheet_swap: Crossfade,  // 시트 내용, 보기나 카드가 바뀌면 겹쳐 바꿈
     list_swap: Crossfade,   // 히스토리·검색 제외 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리)
     star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
@@ -1231,16 +1259,19 @@ impl Popup {
             exclude_scroll_s: Spring::new(0.0, 600.0, 46.0),
             keyword_edit: None,
             roll_edit: None,
+            scorecard: Scorecard::default(),
+            scorecard_count: None,
+            score_hold: None,
             hover: Hit::None,
             open_s: OPEN_SPRING,
-            reveal: [Spring::new(0.0, BEAD_SPRING.0, BEAD_SPRING.1); 2],
+            reveal: [Spring::new(0.0, BEAD_SPRING.0, BEAD_SPRING.1); lay::BEADS],
             beads_out: false,
-            reveal_follow: None,
-            bead_press: [Spring::new(1.0, BEAD_SPRING.0, BEAD_SPRING.1); 2],
+            reveal_follow: [None; lay::BEADS],
+            bead_press: [Spring::new(1.0, BEAD_SPRING.0, BEAD_SPRING.1); lay::BEADS],
             bead_down: None,
-            bead_letgo: [false; 2],
+            bead_letgo: [false; lay::BEADS],
             bead_at: None,
-            bead_stretch: [Spring::new(0.0, BEAD_STRETCH.0, BEAD_STRETCH.1); 2],
+            bead_stretch: [Spring::new(0.0, BEAD_STRETCH.0, BEAD_STRETCH.1); lay::BEADS],
             icon_alpha: Tween::new(0.0),
             panel_h: Spring::new(0.0, 330.0, 29.0),
             unfolding: false,
@@ -1248,7 +1279,7 @@ impl Popup {
             close: Tween::new(0.0),
             sel_y: SEL_SPRING,
             scroll_s: Spring::new(0.0, 600.0, 46.0),
-            seg: [SegThumb::new(); 4],
+            seg: [SegThumb::new(); 8],
             sheet_swap: Crossfade::new(),
             list_swap: Crossfade::new(),
             star: None,
@@ -1412,7 +1443,7 @@ impl Popup {
             && (!self.open_s.settled()
                 || self.shown_at.elapsed().as_secs_f32() < OPEN_FADE
                 || self.reveal.iter().any(|r| !r.settled())
-                || self.reveal_follow.is_some()
+                || self.reveal_follow.iter().any(Option::is_some)
                 || self.bead_press.iter().chain(&self.bead_stretch).any(|s| !s.settled_to(BEAD_REST))
                 || !self.icon_alpha.done()
                 || !self.panel_h.settled_to(PANEL_REST)
@@ -1617,11 +1648,11 @@ impl Popup {
         self.shown_at = Instant::now();
         self.reveal.iter_mut().for_each(|r| r.snap(0.0));
         self.beads_out = false;
-        self.reveal_follow = None;
+        self.reveal_follow = [None; lay::BEADS];
         self.bead_press.iter_mut().for_each(|s| s.snap(1.0));
         self.bead_down = None;
         self.bead_at = None;
-        self.bead_letgo = [false; 2];
+        self.bead_letgo = [false; lay::BEADS];
         self.bead_stretch.iter_mut().for_each(|s| s.snap(0.0));
         self.icon_alpha.snap(0.0);
         self.panel_h.snap(0.0);
@@ -1691,6 +1722,7 @@ impl Popup {
         self.end_drag();
         self.release_toggle();
         self.release_bead();
+        self.stop_score_hold();
         self.notify_composition(CPS_CANCEL); // 조합 중이던 글자는 숨겨질 때까지 그려 둠
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_CARET);
@@ -1808,17 +1840,14 @@ impl Popup {
     }
 
     /// 버튼 `k`가 지금 그려지는 위치, 사슬처럼 차례로 짜내듯 나와 살짝 넘침
-    /// 히스토리가 먼저 바 끝에서 나와 오른쪽 끝에 서고, 톱니가 그 안에서 나오는 동안
-    /// 히스토리는 줄어드는 바를 따라 왼쪽으로 비켜남 (들어갈 땐 거꾸로)
+    /// 맨 왼쪽 버튼이 먼저 바 끝에서 나와 오른쪽 끝에 서고, 다음 버튼이 그 안에서 나오는 동안
+    /// 먼저 나온 버튼들은 줄어드는 바를 따라 왼쪽으로 비켜남 (들어갈 땐 거꾸로)
     fn bead_now(&self, k: usize) -> (f32, f32, f32) {
         let (gx, gy, rad) = self.bead_circle(BEAD_GEAR);
-        let [rh, rg] = self.reveal.map(|s| s.value);
-        let x = gx - (1.0 - rh) * self.px(lay::BTN_D) * 0.65;
-        let (x, r) = match k {
-            BEAD_HISTORY => (x - self.px(lay::BTN_D + lay::BTN_GAP) * rg.clamp(-0.15, 1.15), rh),
-            _ => (x, rg),
-        };
-        (x, gy, rad * (0.55 + 0.45 * r.clamp(0.0, 1.2)))
+        let x = gx - (1.0 - self.reveal[0].value) * self.px(lay::BTN_D) * 0.65;
+        let slide: f32 = self.reveal[k + 1..].iter().map(|s| s.value.clamp(-0.15, 1.15)).sum();
+        let x = x - self.px(lay::BTN_D + lay::BTN_GAP) * slide;
+        (x, gy, rad * (0.55 + 0.45 * self.reveal[k].value.clamp(0.0, 1.2)))
     }
 
     /// 버튼 `k`의 아이콘이 보이는 정도, 거의 다 나와야 (진행 0.6부터) 보이고 눌림
@@ -1846,11 +1875,11 @@ impl Popup {
         }
         // 커서가 가만히 있어도 버튼이 움직여 누른 자리가 원 밖이 될 수 있음
         self.follow_press();
-        let [rh, rg] = self.reveal;
-        // `bead_now`의 x를 시간으로 미분 (DIP/초), 히스토리는 톱니가 나오는 만큼 왼쪽으로 비켜남
-        let gear = 0.65 * lay::BTN_D * rh.velocity;
-        let slide = if (-0.15..=1.15).contains(&rg.value) { (lay::BTN_D + lay::BTN_GAP) * rg.velocity } else { 0.0 };
-        for (k, v) in [(BEAD_HISTORY, gear - slide), (BEAD_GEAR, gear)] {
+        // `bead_now`의 x를 시간으로 미분 (DIP/초), 오른쪽 버튼이 나오는 만큼 왼쪽으로 비켜남
+        let lead = 0.65 * lay::BTN_D * self.reveal[0].velocity;
+        let slide = |r: &Spring| if (-0.15..=1.15).contains(&r.value) { (lay::BTN_D + lay::BTN_GAP) * r.velocity } else { 0.0 };
+        for k in 0..lay::BEADS {
+            let v = lead - self.reveal[k + 1..].iter().map(slide).sum::<f32>();
             // 끝이 꺾이지 않게 tanh로 포화
             self.bead_stretch[k].target = BEAD_STRETCH_MAX * (v.abs() / BEAD_STRETCH_SPEED).tanh();
             self.bead_stretch[k].step(dt);
@@ -1869,7 +1898,7 @@ impl Popup {
         let (hw, hh) = ((bar.right - bar.left) / 2.0, (bar.bottom - bar.top) / 2.0);
         let r = (bar.bottom - bar.top).min(self.px(lay::BAR_R) * 2.0) / 2.0;
         let bar = blob::Shape::Bar { cx: (bar.left + hw) as f64, hw: hw as f64, hh: hh as f64, r: r.min(hw) as f64 };
-        let drawn = || [BEAD_HISTORY, BEAD_GEAR].into_iter().filter(|&k| self.reveal[k].value > 0.02);
+        let drawn = || (0..lay::BEADS).filter(|&k| self.reveal[k].value > 0.02);
         let bead_ellipse = |k: usize, full: bool| {
             let (cx, _, rx, ry) = self.bead_shape(k, full);
             blob::Shape::Ellipse { cx: cx as f64, rx: rx as f64, ry: ry as f64 }
@@ -1976,6 +2005,7 @@ impl Popup {
             View::Exclude => Sheet::Exclude,
             View::History => Sheet::History,
             View::Keywords => Sheet::Keywords,
+            View::Scorecard => Sheet::Scorecard,
             View::Results if self.card().is_some() => Sheet::Card,
             View::Results => Sheet::Results,
         }
@@ -2006,7 +2036,7 @@ impl Popup {
     /// 주소는 검색을 기다리지 않고 지금 글로 봄, 붙여 넣는 순간 입력 칸도 같이 넓어져 글이 나중에 안 튐
     fn shows_cond(&self) -> bool {
         match self.view {
-            View::Keywords | View::Rolls => false,
+            View::Keywords | View::Rolls | View::Scorecard => false,
             View::Results => playlist::id(self.edit.text()).is_none(),
             View::Settings | View::Exclude | View::History => true,
         }
@@ -2268,6 +2298,8 @@ impl Popup {
             // 줄이 넘치면 판 끝까지, 모두 들어가면 마지막 줄 아래 8을 남김
             Sheet::Exclude => self.px(lay::EXCLUDE_TOP) + self.px(lay::PAD) + self.exclude_list_h() + self.exclude_bottom_pad(),
             Sheet::Keywords => self.keyword_layout().height,
+            // ponytail: 화면이 낮으면 아래가 잘림, 그런 화면이 있으면 설정 시트처럼 스크롤
+            Sheet::Scorecard => self.px(scorecard_sheet::SHEET_H),
             Sheet::Card => self.px(lay::CARD_H),
             Sheet::Results if self.playlist_waiting() => 0.0,
             _ if !self.listing() => 0.0,
@@ -2347,7 +2379,7 @@ impl Popup {
 
     fn hit(&self, x: f32, y: f32) -> Hit {
         // 버튼은 지금 그려진 원으로 판정, 아이콘이 보이는 버튼만 (`bead_shown`), 둘 다 걸리면 가운데가 가까운 쪽
-        let bead = [(BEAD_HISTORY, Hit::History), (BEAD_GEAR, Hit::Gear)]
+        let bead = [(BEAD_SCORE, Hit::Scorecard), (BEAD_HISTORY, Hit::History), (BEAD_GEAR, Hit::Gear)]
             .into_iter()
             .filter_map(|(k, h)| {
                 let (bx, by, br) = self.bead_now(k);
@@ -2411,6 +2443,9 @@ impl Popup {
             if inside(&rl.done, x, y) {
                 return Hit::DoneRolls;
             }
+        }
+        if self.view == View::Scorecard {
+            return self.scorecard_hit(x, y);
         }
         if self.view == View::Settings {
             // 더 긴 시트에서 판이 줄어드는 동안에도 그림은 보이는 칸까지만이라 그 아래는 안 눌림
@@ -2900,6 +2935,9 @@ impl Popup {
         if v.searches_sheet() {
             self.begin_list_search(restore);
         }
+        if v == View::Scorecard {
+            self.enter_scorecard();
+        }
         // 설정에서 모은 휠 값이 다른 목록으로, 다른 목록 것이 설정으로 넘어가지 않게
         if (v == View::Settings || self.view == View::Settings) && self.settings_scroll_max() > 0.0 {
             self.wheel_acc = 0;
@@ -3080,6 +3118,7 @@ impl Popup {
     /// 검색 제외 시트에서 화살표로 고른 줄이 있으면 Space는 그 줄 토글, 없으면 찾는 글의 공백
     fn space_toggles_row(&self) -> bool {
         self.view == View::Exclude && self.exclude_focus.is_some()
+            || self.view == View::Scorecard && self.scorecard.focus.is_some()
     }
 
     /// 처리하지 않은 편집 키는 입력 칸의 공통 처리로 넘김
@@ -3621,6 +3660,7 @@ impl Popup {
     /// 시트를 열기 전 입력·검색어·결과 선택으로 돌아감
     /// 검색창을 닫거나 다시 열 때도 불림, 찾던 글이 검색어로 남지 않게
     fn restore_list_query(&mut self) -> Option<(Row, usize)> {
+        self.leave_scorecard();
         let h = self.list_edit.take()?;
         self.restore_saved_query(h)
     }
@@ -3801,6 +3841,8 @@ impl Popup {
             self.fill_exclude();
         } else if self.view == View::History {
             self.fill_history();
+        } else if self.view == View::Scorecard {
+            self.scorecard_typed(&q);
         } else if !q.trim().is_empty() {
             if let Some(id) = playlist::id(&q) {
                 self.begin_playlist(id);
@@ -3842,9 +3884,12 @@ impl Popup {
         let shown = self.playlist.take().filter(|p| p.id == id).and_then(|p| p.data);
         let data = shown.or_else(|| self.library.copies.get(id).cloned());
         self.results = data.as_ref().map(|p| self.playlist_rows(p)).unwrap_or_default();
-        let waiting = data.is_none();
-        self.playlist = Some(PlaylistView { id: id.into(), data, note: None, waiting, restore: None });
-        self.playlist_request = Some(id.into());
+        // 성과표로 만든 로컬 플레이리스트는 받을 데가 없음, 사본이 없으면 다시 만들라고 알림
+        let local = playlist::is_local(id);
+        let note = (local && data.is_none()).then_some(playlist::LOCAL_GONE);
+        let waiting = data.is_none() && !local;
+        self.playlist = Some(PlaylistView { id: id.into(), data, note, waiting, restore: None });
+        self.playlist_request = (!local).then(|| id.into());
     }
 
     /// 고를 수 있는 패턴이면 그 줄: 내 목록에 있는 곡이고 그 모드·난이도 패턴이 있음
@@ -3982,6 +4027,9 @@ impl Popup {
 
     /// 줄 오른쪽 레벨 칸 너비 (DIP), 모드까지 쓰는 시트는 넓힘
     fn level_w(&self) -> f32 {
+        if self.local_playlist() {
+            return scorecard_sheet::LEVEL_W;
+        }
         if self.mode_levels() { lay::PLAYLIST_LEVEL_W } else { lay::LEVEL_W }
     }
 
@@ -4391,9 +4439,20 @@ impl Popup {
         }
     }
 
-    /// 세그먼트마다 고른 칸: 모드, 난이도, 히스토리 탭, 검색 제외 탭
-    fn segment_choices(&self) -> [usize; 4] {
-        [self.mode_choice.index(), self.diff_choice.index(), self.history_tab as usize, self.exclude_tab as usize]
+    /// 세그먼트마다 고른 칸: 모드, 난이도, 히스토리 탭, 검색 제외 탭, 성과표 모드·플레이·맥스콤보·범위
+    fn segment_choices(&self) -> [usize; 8] {
+        let c = &self.scorecard.cond;
+        [
+            self.mode_choice.index(),
+            self.diff_choice.index(),
+            self.history_tab as usize,
+            self.exclude_tab as usize,
+            self.scorecard.mode.index(),
+            // 왼쪽 칸이 "함", "O", "전체"
+            !c.played as usize,
+            !c.mc as usize,
+            !self.scorecard.all as usize,
+        ]
     }
 
     fn snap_segments(&mut self) {
@@ -4451,6 +4510,7 @@ impl Popup {
             },
             View::Rolls => "나온 곡에서 찾기",
             View::Keywords => "추가할 키워드를 입력해 주세요",
+            View::Scorecard => "V-ARCHIVE 닉네임",
             View::History if self.history_tab == HistoryTab::Favorites => "즐겨찾기에서 찾기",
             View::History => "최근 기록에서 찾기",
             _ => "곡 · 초성 · 작곡가 · 디맥지지 플리",
@@ -4482,10 +4542,10 @@ impl Popup {
     /// 두 버튼용 호버 머무름·떠남 시간 처리, 앞 버튼이 먼저 움직이고 다른 버튼은 시차 뒤에 따라감
     /// 설정·히스토리 보기 (히스토리에서 연 키워드·뽑은 기록 시트 포함)에선 늘 나옴
     fn update_reveal(&mut self, now: Instant) {
-        if let Some((at, k, to)) = self.reveal_follow {
-            if now >= at {
+        for k in 0..lay::BEADS {
+            if let Some((_, to)) = self.reveal_follow[k].filter(|&(at, _)| now >= at) {
                 self.reveal[k].target = to;
-                self.reveal_follow = None;
+                self.reveal_follow[k] = None;
             }
         }
         let mut want = self.beads_out;
@@ -4501,7 +4561,7 @@ impl Popup {
                 self.leave_since = None;
             }
         }
-        if matches!(self.bead_view(), View::Settings | View::History) {
+        if matches!(self.bead_view(), View::Settings | View::History | View::Scorecard) {
             want = true;
         }
         if self.closing {
@@ -4514,9 +4574,11 @@ impl Popup {
         // 들어갈 땐 지금 민 거리에서 바와 같이 돌아옴 (`return_scroll`)
         let r = self.bar_reveal();
         self.text_return = (!want && r > 0.0).then_some((self.text_scroll, r));
-        let (lead, follow, to) = if want { (BEAD_HISTORY, BEAD_GEAR, 1.0) } else { (BEAD_GEAR, BEAD_HISTORY, 0.0) };
-        self.reveal[lead].target = to;
-        self.reveal_follow = Some((now + BEAD_STAGGER, follow, to));
+        let to = if want { 1.0 } else { 0.0 };
+        for i in 0..lay::BEADS {
+            let k = if want { i } else { lay::BEADS - 1 - i };
+            self.reveal_follow[k] = Some((now + BEAD_STAGGER * i as u32, to));
+        }
         if want {
             self.icon_alpha.go_delayed(1.0, 0.09, 0.12, Ease::STANDARD);
         } else {
@@ -4581,6 +4643,10 @@ impl Popup {
                         char::from_u32(c).filter(|_| c >= 0x20 && c != 0x7F)
                     }
                 };
+                // 성과표 스코어·서열 칸에 포커스가 있으면 숫자는 그 칸으로
+                if self.view == View::Scorecard && ch.is_some_and(|ch| self.scorecard.type_char(ch)) {
+                    return Some((0, Action::None));
+                }
                 if let Some(ch) = ch {
                     self.edit.insert(ch.encode_utf8(&mut [0; 4]));
                     self.requery(Edit::Typed);
@@ -4678,6 +4744,9 @@ impl Popup {
                 if let Some(action) = self.exclude_key(vk, lp.0 & (1 << 30) != 0) {
                     return Some((0, action));
                 }
+                if let Some(action) = self.scorecard_key(vk, shift) {
+                    return Some((0, action));
+                }
                 let act = if self.view == View::Settings { self.settings_key(vk) } else { self.list_key(vk, ctrl, shift) };
                 Some((0, act))
             }
@@ -4699,6 +4768,9 @@ impl Popup {
             WM_MOUSEWHEEL => {
                 // 한 칸에 한 줄, 정밀 휠과 터치패드는 모아서 칸으로 셈
                 let d = ((wp.0 >> 16) as i16) as i32;
+                if self.view == View::Scorecard {
+                    return Some((0, self.scorecard_wheel(d)));
+                }
                 if matches!(self.view, View::Results | View::History | View::Rolls | View::Exclude)
                     || (self.view == View::Settings && self.settings_scroll_max() > 0.0)
                 {
@@ -4752,6 +4824,11 @@ impl Popup {
                 self.release_exclude();
                 Some((0, if over { self.toggle_exclude(i) } else { Action::None }))
             }
+            // 누르고 있던 값 칸을 떼면 바뀐 값을 저장
+            WM_LBUTTONUP if self.score_hold.is_some() => {
+                self.stop_score_hold();
+                Some((0, Action::Choice))
+            }
             WM_LBUTTONUP if self.bead_down.is_some() => {
                 self.release_bead();
                 Some((0, Action::None))
@@ -4769,6 +4846,10 @@ impl Popup {
             }
             WM_CAPTURECHANGED => {
                 self.dragging = false;
+                if self.score_hold.is_some() {
+                    self.stop_score_hold();
+                    return Some((0, Action::Choice));
+                }
                 if let Some(i) = self.exclude_down.take() {
                     self.exclude_rows[i].motion.press.go(1.0, QUICK_SECS, QUICK_EASE);
                 }
@@ -4812,6 +4893,9 @@ impl Popup {
                 }
                 if wp.0 == TIMER_SEARCH {
                     self.search_now();
+                }
+                if wp.0 == TIMER_REPEAT {
+                    self.scorecard_repeat();
                 }
                 Some((0, Action::None)) // 그리는 건 호출하는 쪽 (캐럿 깜빡임도)
             }
@@ -4988,8 +5072,7 @@ impl Popup {
             && y <= bar.bottom + self.px(6.0)
             && x >= bar.left + (bar.right - bar.left) * 0.55
             && x <= gx + gr + self.px(6.0))
-            || near(BEAD_HISTORY)
-            || near(BEAD_GEAR);
+            || (0..lay::BEADS).any(near);
         self.in_zone = in_zone;
         if in_zone {
             self.leave_since = None;
@@ -5062,6 +5145,13 @@ impl Popup {
                 self.press_bead(BEAD_HISTORY, (x, y));
                 Action::None
             }
+            Hit::Scorecard => {
+                let act = self.toggle_scorecard();
+                self.press_bead(BEAD_SCORE, (x, y));
+                act
+            }
+            Hit::ScoreSlot(slot, i) => self.scorecard_click(slot, i),
+            Hit::ScoreCheck(slot) => self.scorecard_check(slot),
             Hit::ModeSeg(i) => {
                 self.set_mode(Mode::ALL[i]);
                 self.kb_focus = None;
@@ -5638,7 +5728,7 @@ impl Popup {
         // 둥근 사각형은 반지름이 높이 절반을 넘으면 모양이 정해지지 않음
         let pr = self.px(lay::PANEL_R).min((panel.bottom - panel.top) / 2.0).min((panel.right - panel.left) / 2.0);
         let (gx, _gy, gr) = self.bead_circle(BEAD_GEAR);
-        let beads = [BEAD_HISTORY, BEAD_GEAR].map(|k| self.bead_shape(k, true));
+        let beads: [_; lay::BEADS] = std::array::from_fn(|k| self.bead_shape(k, true));
         // 열 땐 따로 페이드 인, 닫을 땐 그 순간의 불투명도에서 흐려짐
         let fade = 1.0 - self.close.value();
         let open_t = Ease::OUT.apply((self.shown_at.elapsed().as_secs_f32() / OPEN_FADE).min(1.0)) * fade;
@@ -5781,6 +5871,10 @@ impl Popup {
                     let ll = g.layout(&label, &f.item_bold, lvl_w, self.px(20.0))?;
                     ll.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
                     dc.DrawTextLayout(gfx::pt(lx, title_base - baseline(&ll)), &ll, title_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    // 성과표로 만든 플레이리스트는 서열 대신 Max·Perfect, 스코어, 서열 세 칸
+                    if self.draw_local_marks(j, lx, sub_base, floor, if dim { &off_b } else { &floor_b })? {
+                        continue;
+                    }
                     if let Some(fl) = floor {
                         let fl = g.layout(&format!("{fl:.1}"), &f.sub, lvl_w, self.px(16.0))?;
                         fl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
@@ -5831,6 +5925,8 @@ impl Popup {
             let draw_sheet = |list: Option<&ID2D1Image>| -> Result<()> {
                 if self.sheet == Sheet::Settings {
                     self.draw_settings((l0, r0))?;
+                } else if self.sheet == Sheet::Scorecard {
+                    self.draw_scorecard((l0, r0))?;
                 } else if self.sheet == Sheet::Exclude {
                     self.draw_exclude_head()?;
                     if let Some(list) = list {
@@ -5946,7 +6042,11 @@ impl Popup {
             // 그 보기가 열려 있으면 눌린 채 (`bead_view`), 아니면 호버할 때 밝아짐
             let ia = self.icon_alpha.value();
             let pressed = self.bead_view();
-            let icons = [(BEAD_HISTORY, Hit::History, View::History, Icon::History), (BEAD_GEAR, Hit::Gear, View::Settings, Icon::Settings)];
+            let icons = [
+                (BEAD_SCORE, Hit::Scorecard, View::Scorecard, Icon::Scorecard),
+                (BEAD_HISTORY, Hit::History, View::History, Icon::History),
+                (BEAD_GEAR, Hit::Gear, View::Settings, Icon::Settings),
+            ];
             for (k, hit, view, icon) in icons {
                 let (bx, by, rx, ry) = beads[k];
                 let ia = ia * self.bead_shown(k);
@@ -5987,8 +6087,7 @@ impl Popup {
                 };
                 let panel_key = if has_panel { [panel.left, panel.top, panel.right, panel.bottom, panel_a] } else { [0.0; 5] };
                 let mut key = vec![bar.left, bar.top, bar.right, bar.bottom, open_t, k];
-                key.extend(bead(0));
-                key.extend(bead(1));
+                (0..lay::BEADS).for_each(|i| key.extend(bead(i)));
                 key.extend(panel_key);
                 g.paint_mask(&key, || {
                     dc.PushLayer(&gfx::layer(open_t, None), None);

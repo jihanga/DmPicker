@@ -181,7 +181,7 @@ impl Catalog {
     }
 
     /// 고를 수 있는 곡, 꺼 둔 팩과 숨긴 곡은 늘 뺌
-    fn allowed(&self, i: usize, owned: Option<&HashSet<u32>>) -> bool {
+    pub fn allowed(&self, i: usize, owned: Option<&HashSet<u32>>) -> bool {
         let song = &self.songs[i];
         self.owns(i, owned) && !self.hidden_dlc.contains(&song.dlc_code) && !self.hidden_songs.contains(&song.id)
     }
