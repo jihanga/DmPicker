@@ -1,3 +1,10 @@
+> [!NOTE]
+> 이 저장소는 [eun-yeon/DmPicker](https://github.com/eun-yeon/DmPicker)를 개인적으로 수정한 포크입니다.
+> 아래 [성과표 플레이리스트](#성과표-플레이리스트-포크-기능)는 포크에서 따로 추가한 기능으로, 원 개발자의 요청이 있으면 예고 없이 삭제될 수 있습니다.
+> 이 기능에 대한 문의와 제보는 원 저장소가 아닌 이 저장소에 남겨 주세요.
+>
+> 새 버전 알림은 원 저장소 기준이라, 알림을 따라 받으면 이 기능이 없는 원본 버전이 설치됩니다.
+
 <img src="crates/dmpicker-app/assets/icon.ico" alt="DM PICKER" width="72" height="72">
 
 # DM PICKER
@@ -20,12 +27,7 @@
 
 [다운로드](https://github.com/eun-yeon/DmPicker/releases/latest) · [사용 가이드](https://djmax.gg/dmpicker/guide)
 
-> [!NOTE]
-> 이 저장소는 [eun-yeon/DmPicker](https://github.com/eun-yeon/DmPicker)를 개인적으로 수정한 포크입니다.
-> 아래 [성과표 플레이리스트](#성과표-플레이리스트-포크-기능)는 포크에서 따로 추가한 기능으로, 원 개발자의 요청이 있으면 예고 없이 삭제될 수 있습니다.
-> 이 기능에 대한 문의와 제보는 원 저장소가 아닌 이 저장소에 남겨 주세요.
->
-> 새 버전 알림은 원 저장소 기준이라, 알림을 따라 받으면 이 기능이 없는 원본 버전이 설치됩니다.
+
 
 ## 주요 기능
 
